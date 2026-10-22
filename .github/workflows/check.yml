@@ -4,7 +4,7 @@ jobs:
   check:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - run: brew install shellcheck
       - run: shellcheck bin/daily-clean install.sh uninstall.sh
       - run: /usr/bin/python3 -m py_compile bin/resource-watchdog
