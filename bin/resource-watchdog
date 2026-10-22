@@ -1,0 +1,364 @@
+#!/usr/bin/python3
+"""Resource watchdog for coding-agent and dev-tool processes.
+
+Every INTERVAL seconds it samples `ps`, groups eligible processes by process group
+(agents run each command in its own group, so a group is "that one test/command"),
+and terminates a group when:
+
+  overload  the machine is busy (OVERLOAD_SYSTEM_PCT of all cores over OVERLOAD_WINDOW)
+            and the group used >= OVERLOAD_GROUP_PCT (100 = one core) in that window
+  runaway   the group used >= RUNAWAY_GROUP_PCT over RUNAWAY_WINDOW (stuck loop)
+  memory    the group's memory footprint >= MEMORY_GROUP_GB, or macOS reports memory pressure
+            and it is the largest group with >= MEMORY_PRESSURE_GROUP_GB
+  stale     an orphaned dev-tool process (parent died, no terminal) older than
+            STALE_ORPHAN_HOURS
+
+Eligible: descends from a coding agent (omp, claude, codex, ...), or is a dev tool
+(node, bun, python, vitest, ...) that descends from a terminal or was orphaned.
+Never touched: groups containing an agent or terminal, app bundles, system binaries,
+launchd jobs, and shells (a shell sees its child die and returns 143 to the agent).
+
+Kill = SIGTERM, then SIGKILL after KILL_GRACE seconds. Each kill is appended to LOG_FILE,
+shown as a notification, and printed to the process's terminal when it has one. Kills of
+running commands (not stale orphans) are also appended to AGENT_NOTES_FILE, which agents
+are told to read when a command of theirs dies with 143/137 (see agent-rules.md).
+
+Usage: resource-watchdog [--dry-run] [--once]
+Every CONFIG value can be overridden with a WATCHDOG_<NAME> environment variable.
+"""
+
+import collections
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+
+CONFIG = {
+    "INTERVAL": 10,
+    "OVERLOAD_WINDOW": 120,
+    "OVERLOAD_SYSTEM_PCT": 85,
+    "OVERLOAD_GROUP_PCT": 300,
+    "RUNAWAY_WINDOW": 1200,
+    "RUNAWAY_GROUP_PCT": 90,
+    "MEMORY_GROUP_GB": 8,
+    "MEMORY_PRESSURE_GROUP_GB": 1.5,
+    "MEMORY_PRESSURE_SECONDS": 30,
+    "STALE_ORPHAN_HOURS": 3,
+    "KILL_GRACE": 10,
+}
+for _name, _default in CONFIG.items():
+    CONFIG[_name] = type(_default)(os.environ.get("WATCHDOG_" + _name, _default))
+
+STATE_DIR = os.path.expanduser("~/.local/state")
+LOG_FILE = os.path.join(STATE_DIR, "resource-watchdog.log")
+AGENT_NOTES_FILE = os.path.join(STATE_DIR, "resource-watchdog-kills.txt")
+AGENT_NOTES_KEEP = 20  # newest kills kept in AGENT_NOTES_FILE
+
+AGENTS = {"omp", "claude", "codex", "cursor-agent", "opencode", "gemini", "amp", "droid", "aider", "goose"}
+TERMINALS = {"ghostty", "Terminal", "iTerm2", "wezterm-gui", "kitty", "alacritty", "Warp"}
+SHELLS = {"zsh", "bash", "sh", "fish", "dash", "nu", "login", "-zsh", "-bash"}
+DEV_TOOL = re.compile(
+    r"^(node|bun|deno|tsx|ts-node|python\d*(\.\d+)?|Python|pytest|uv|ruby|rspec|go|cargo|rustc"
+    r"|java|vitest|jest|playwright|chrome-headless-shell|Chromium|esbuild|tsc|turbo|next-server"
+    r"|vite|webpack|pnpm|npm|npx|yarn|sst|terraform-provider-.*|maestro)$"
+)
+SYSTEM_PREFIXES = ("/System/", "/usr/libexec/", "/usr/sbin/", "/sbin/", "/Library/Apple/")
+# App bundles are protected, except runtimes that only live inside one.
+BUNDLE_EXCEPTIONS = ("/ms-playwright/", "/Python.app/Contents/MacOS/", "/chrome-headless-shell")
+
+Proc = collections.namedtuple("Proc", "pid ppid pgid rss_kb cpu_s age_s tty exe name args")
+
+
+def parse_clock(text):
+    """'[[dd-]hh:]mm:ss[.ff]' -> seconds."""
+    days, _, clock = text.rpartition("-")
+    seconds = 0.0
+    for part in clock.split(":"):
+        seconds = seconds * 60 + float(part)
+    return seconds + (int(days) * 86400 if days else 0)
+
+
+def snapshot():
+    fields = subprocess.run(
+        ["ps", "-axo", "pid=,ppid=,pgid=,rss=,time=,etime=,tty=,args="],
+        capture_output=True, text=True, check=True,
+    ).stdout
+    exes = subprocess.run(["ps", "-axo", "pid=,comm="], capture_output=True, text=True, check=True).stdout
+    exe_by_pid = {}
+    for line in exes.splitlines():
+        pid, _, exe = line.strip().partition(" ")
+        exe_by_pid[int(pid)] = exe.strip()
+    procs = {}
+    for line in fields.splitlines():
+        parts = line.split(None, 7)
+        if len(parts) < 7:
+            continue
+        pid = int(parts[0])
+        exe = exe_by_pid.get(pid, "")
+        procs[pid] = Proc(
+            pid=pid, ppid=int(parts[1]), pgid=int(parts[2]), rss_kb=int(parts[3]),
+            cpu_s=parse_clock(parts[4]), age_s=parse_clock(parts[5]), tty=parts[6],
+            exe=exe, name=os.path.basename(exe), args=parts[7] if len(parts) > 7 else "",
+        )
+    return procs
+
+
+def launchd_job_pids():
+    out = subprocess.run(["launchctl", "list"], capture_output=True, text=True).stdout
+    return {int(line.split()[0]) for line in out.splitlines()[1:] if line.split()[0].isdigit()}
+
+
+def memory_footprints_kb():
+    """Physical footprint (Activity Monitor's "Memory") of the 200 largest processes.
+
+    RSS leaves out compressed memory, which is most of what a leaking process holds on macOS.
+    """
+    # Absolute path: a different `top` may shadow the system one on PATH.
+    out = subprocess.run(["/usr/bin/top", "-l", "1", "-o", "mem", "-n", "200", "-stats", "pid,mem"],
+                         capture_output=True, text=True).stdout
+    units = {"B": 1 / 1024, "K": 1, "M": 1024, "G": 1048576, "T": 1073741824}
+    footprints = {}
+    for line in out.splitlines():
+        match = re.match(r"^\s*(\d+)\s+([\d.]+)([BKMGT])[+-]?\s*$", line, re.IGNORECASE)
+        if match:
+            footprints[int(match.group(1))] = float(match.group(2)) * units[match.group(3).upper()]
+    return footprints
+
+
+
+def memory_pressure_level():
+    """1 normal, 2 warning, 4 critical."""
+    out = subprocess.run(["sysctl", "-n", "kern.memorystatus_vm_pressure_level"], capture_output=True, text=True)
+    return int(out.stdout.strip() or 1)
+
+
+def is_protected(proc, launchd_pids):
+    if proc.pid in (os.getpid(), 0, 1) or proc.pid in launchd_pids:
+        return True
+    if proc.exe.startswith(SYSTEM_PREFIXES):
+        return True
+    if ".app/Contents/" in proc.exe and not any(x in proc.exe for x in BUNDLE_EXCEPTIONS):
+        return True
+    return proc.name in AGENTS or proc.name in TERMINALS or proc.name in SHELLS
+
+
+def ancestors(proc, procs):
+    seen = set()
+    while proc.ppid > 1 and proc.ppid in procs and proc.ppid not in seen:
+        seen.add(proc.ppid)
+        proc = procs[proc.ppid]
+        yield proc
+
+
+def classify(proc, procs, launchd_pids):
+    """Returns 'agent', 'terminal', 'orphan' when eligible, else None."""
+    if is_protected(proc, launchd_pids):
+        return None
+    names = {p.name for p in ancestors(proc, procs)}
+    if names & AGENTS:
+        return "agent"
+    if not DEV_TOOL.match(proc.name):
+        return None
+    if names & TERMINALS:
+        return "terminal"
+    if proc.ppid == 1 and proc.tty.startswith("?"):
+        return "orphan"
+    return None
+
+
+class Watchdog:
+    def __init__(self, dry_run):
+        self.dry_run = dry_run
+        self.started = time.time()
+        self.history = collections.defaultdict(collections.deque)  # pid -> deque[(t, cpu_s)]
+        self.system_history = collections.deque()  # (t, total cpu_s of all processes)
+        self.pressure_since = None
+        self.ncpu = os.cpu_count() or 1
+
+    def cpu_pct(self, pid, proc, now, window):
+        """CPU over the last `window` seconds, 100 = one core. None if not observed long enough."""
+        if proc.age_s <= window:
+            return proc.cpu_s / max(proc.age_s, 1) * 100
+        past = next(((t, c) for t, c in self.history[pid] if t <= now - window), None)
+        if past is None:
+            return None
+        return (proc.cpu_s - past[1]) / (now - past[0]) * 100
+
+    def record(self, procs, now):
+        keep = max(CONFIG["OVERLOAD_WINDOW"], CONFIG["RUNAWAY_WINDOW"]) + 2 * CONFIG["INTERVAL"]
+        for pid in list(self.history):
+            if pid not in procs:
+                del self.history[pid]
+        for pid, proc in procs.items():
+            h = self.history[pid]
+            h.append((now, proc.cpu_s))
+            while len(h) > 2 and h[1][0] <= now - keep:
+                h.popleft()
+        self.system_history.append((now, sum(p.cpu_s for p in procs.values())))
+        while len(self.system_history) > 2 and self.system_history[1][0] <= now - keep:
+            self.system_history.popleft()
+
+    def system_busy_pct(self, now):
+        window = CONFIG["OVERLOAD_WINDOW"]
+        past = next(((t, c) for t, c in self.system_history if t <= now - window), None)
+        if past is None:
+            return None
+        # Processes that exited drop out of the total; clamp so that never reads as negative load.
+        used = max(self.system_history[-1][1] - past[1], 0)
+        return used / ((now - past[0]) * self.ncpu) * 100
+
+    def tick(self):
+        now = time.time()
+        procs = snapshot()
+        self.record(procs, now)
+        launchd_pids = launchd_job_pids()
+        footprints = memory_footprints_kb()
+
+        groups = collections.defaultdict(list)
+        for proc in procs.values():
+            groups[proc.pgid].append(proc)
+
+        candidates = {}  # pgid -> (eligible members, kind per pid)
+        for pgid, members in groups.items():
+            if any(m.name in AGENTS or m.name in TERMINALS for m in members):
+                continue
+            kinds = {m.pid: classify(m, procs, launchd_pids) for m in members}
+            eligible = [m for m in members if kinds[m.pid]]
+            if eligible:
+                candidates[pgid] = (eligible, kinds)
+
+        busy = self.system_busy_pct(now)
+        pressure = memory_pressure_level()
+        if pressure >= 2:
+            self.pressure_since = self.pressure_since or now
+        else:
+            self.pressure_since = None
+
+        largest = None
+        for pgid, (members, kinds) in candidates.items():
+            mem_gb = sum(footprints.get(m.pid, m.rss_kb) for m in members) / 1048576
+            reason = None
+
+            overload = [self.cpu_pct(m.pid, m, now, CONFIG["OVERLOAD_WINDOW"]) for m in members]
+            runaway = [self.cpu_pct(m.pid, m, now, CONFIG["RUNAWAY_WINDOW"]) for m in members]
+            overload_pct = sum(x for x in overload if x is not None)
+            # Only a group that has existed for the whole window can be a runaway; a fresh
+            # burst is the overload rule's job.
+            group_age = max(m.age_s for m in members)
+            runaway_pct = (None if None in runaway or group_age < CONFIG["RUNAWAY_WINDOW"]
+                           else sum(runaway))
+
+            if mem_gb >= CONFIG["MEMORY_GROUP_GB"]:
+                reason = f"memory: {mem_gb:.1f} GB (limit {CONFIG['MEMORY_GROUP_GB']} GB)"
+            elif busy is not None and busy >= CONFIG["OVERLOAD_SYSTEM_PCT"] and overload_pct >= CONFIG["OVERLOAD_GROUP_PCT"]:
+                reason = (f"cpu overload: {overload_pct:.0f}% CPU over {CONFIG['OVERLOAD_WINDOW']}s "
+                          f"while the machine was {busy:.0f}% busy")
+            elif runaway_pct is not None and runaway_pct >= CONFIG["RUNAWAY_GROUP_PCT"]:
+                reason = f"runaway: {runaway_pct:.0f}% CPU for {CONFIG['RUNAWAY_WINDOW'] / 60:g} min"
+            else:
+                stale = [m for m in members if kinds[m.pid] == "orphan"
+                         and m.age_s >= CONFIG["STALE_ORPHAN_HOURS"] * 3600]
+                if stale and len(stale) == len(members):
+                    reason = f"stale: orphaned for over {CONFIG['STALE_ORPHAN_HOURS']} h"
+
+            if reason:
+                self.kill(members, reason)
+            elif mem_gb >= CONFIG["MEMORY_PRESSURE_GROUP_GB"] and (largest is None or mem_gb > largest[1]):
+                largest = (members, mem_gb)
+
+        if (largest and self.pressure_since
+                and now - self.pressure_since >= CONFIG["MEMORY_PRESSURE_SECONDS"]):
+            level = "critical" if pressure >= 4 else "warning"
+            self.kill(largest[0], f"memory pressure {level}: largest dev process group, {largest[1]:.1f} GB")
+            self.pressure_since = None
+
+    def kill(self, members, reason):
+        lead = max(members, key=lambda m: m.rss_kb + m.cpu_s)
+        command = lead.args[:200]
+        pids = [m.pid for m in members]
+        entry = {
+            "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "action": "would-kill" if self.dry_run else "killed",
+            "reason": reason,
+            "pids": pids,
+            "command": command,
+        }
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(LOG_FILE, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+        if self.dry_run:
+            return
+
+        cwd = subprocess.run(["lsof", "-a", "-p", str(lead.pid), "-d", "cwd", "-Fn"],
+                             capture_output=True, text=True).stdout.rpartition("\nn")[2].strip()
+        message = (f"[resource-watchdog] {time.strftime('%Y-%m-%d %H:%M:%S')} killed pid {lead.pid} "
+                   f"in {cwd or '?'}: {command[:160]}\nReason: {reason}.\n"
+                   f"Do NOT rerun the same command. Run a much smaller scope instead (one test file, "
+                   f"--maxWorkers=2 / -j2, no watch mode) or ask the user first.")
+        if not reason.startswith("stale"):
+            self.append_agent_note(message)
+        for tty in {m.tty for m in members if m.tty.startswith("tty")}:
+            try:
+                with open("/dev/" + tty, "w") as t:
+                    t.write("\n" + message + "\n")
+            except OSError:
+                pass
+
+        self.signal_all(pids, signal.SIGTERM)
+        deadline = time.time() + CONFIG["KILL_GRACE"]
+        while time.time() < deadline and any(self.alive(p) for p in pids):
+            time.sleep(0.5)
+        self.signal_all([p for p in pids if self.alive(p)], signal.SIGKILL)
+
+        subprocess.run([
+            "osascript", "-e",
+            f"display notification {json.dumps(reason)} with title \"Resource watchdog\" "
+            f"subtitle {json.dumps(lead.name + ' (pid ' + str(lead.pid) + ')')}",
+        ], capture_output=True)
+
+    @staticmethod
+    def signal_all(pids, sig):
+        for pid in pids:
+            try:
+                os.kill(pid, sig)
+            except ProcessLookupError:
+                pass
+
+    @staticmethod
+    def alive(pid):
+        try:
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+
+    @staticmethod
+    def append_agent_note(message):
+        """Appends to AGENT_NOTES_FILE, keeping the newest AGENT_NOTES_KEEP notes (newest last)."""
+        notes = []
+        if os.path.exists(AGENT_NOTES_FILE):
+            with open(AGENT_NOTES_FILE) as f:
+                notes = [n for n in f.read().split("\n\n") if n.strip()]
+        notes = (notes + [message.strip()])[-AGENT_NOTES_KEEP:]
+        with open(AGENT_NOTES_FILE, "w") as f:
+            f.write("\n\n".join(notes) + "\n")
+
+
+def main():
+    args = set(sys.argv[1:])
+    dog = Watchdog(dry_run="--dry-run" in args)
+    while True:
+        try:
+            dog.tick()
+        except Exception as exc:  # keep watching; a bad sample must not stop the daemon
+            print(f"{time.strftime('%F %T')} tick failed: {exc!r}", file=sys.stderr, flush=True)
+        if "--once" in args:
+            return
+        time.sleep(CONFIG["INTERVAL"])
+
+
+if __name__ == "__main__":
+    main()

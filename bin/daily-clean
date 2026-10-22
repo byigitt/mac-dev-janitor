@@ -1,0 +1,166 @@
+#!/bin/bash
+# Daily disk cleanup, scheduled by the mac-dev-janitor LaunchAgent (see install.sh).
+# Usage: daily-clean [--dry-run]
+# Log: ~/.local/state/daily-clean.log (set in the LaunchAgent)
+set -u
+
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$HOME/.orbstack/bin"
+
+DRY_RUN=0
+[[ "${1:-}" == "--dry-run" ]] && DRY_RUN=1
+
+LOCK_DIR="${TMPDIR:-/tmp}/daily-clean.lock"
+if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+    echo "$(date '+%F %T') another run is in progress, exiting"
+    exit 0
+fi
+trap 'rmdir "$LOCK_DIR"' EXIT
+
+log() { printf '%s %s\n' "$(date '+%F %T')" "$*"; }
+strip_ansi() { sed -E $'s/\x1b\\[[0-9;?]*[a-zA-Z]//g; s/\r//g'; }
+free_kb() { df -k /System/Volumes/Data | awk 'NR==2 {print $4}'; }
+gb() { awk -v kb="$1" 'BEGIN {printf "%.1f GB", kb / 1048576}'; }
+
+T3_DB="$HOME/.t3/userdata/statev2.sqlite"
+T3_WORKTREES="$HOME/.t3/worktrees"
+T3_SETTLED_DAYS=3  # remove once every thread on the worktree is settled/archived/deleted this long
+T3_ORPHAN_DAYS=14  # worktrees no t3 thread points at: idle (last commit / creation) this long
+
+# Prints "<worktree path>\t<1 if every thread is done>\t<last thread update, epoch>" per worktree.
+t3_worktree_states() {
+    sqlite3 -readonly -separator $'\t' "file:$T3_DB?mode=ro" <<'SQL'
+with t as (
+    select
+        json_extract(payload_json, '$.worktreePath') as wt,
+        (
+            json_extract(payload_json, '$.settledOverride') = 'settled'
+            or (
+                json_extract(payload_json, '$.settledOverride') is null
+                and json_extract(payload_json, '$.settledAt') is not null
+                and coalesce(json_extract(payload_json, '$.unsettledAt'), '') < json_extract(payload_json, '$.settledAt')
+            )
+            or json_extract(payload_json, '$.archivedAt') is not null
+            or json_extract(payload_json, '$.deletedAt') is not null
+            or archived_at is not null
+            or deleted_at is not null
+        ) as done,
+        updated_at as u
+    from orchestration_v2_projection_threads
+)
+select wt, min(done), cast(strftime('%s', max(u)) as integer)
+from t
+where wt is not null
+group by wt;
+SQL
+}
+
+# `git worktree remove` (no --force) refuses worktrees with modified or untracked files,
+# so unsaved work is never lost. The branch and its commits stay in the main repo.
+remove_worktree() {
+    local wt="$1" reason="$2" common out
+    common=$(git -C "$wt" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || {
+        echo "  kept $wt: not a git worktree"
+        return
+    }
+    if ((DRY_RUN)); then
+        echo "  (dry-run) would remove $wt ($reason)"
+        return
+    fi
+    if out=$(git -C "${common%/.git}" worktree remove "$wt" 2>&1); then
+        echo "  removed $wt ($reason)"
+    else
+        echo "  kept $wt: ${out//$'\n'/ }"
+    fi
+}
+
+prune_t3_worktrees() {
+    log "▶ t3 worktrees (settled ${T3_SETTLED_DAYS}d+, orphaned ${T3_ORPHAN_DAYS}d+)"
+    if [[ ! -f "$T3_DB" ]]; then
+        echo "  no t3 database, skipped"
+        return
+    fi
+    local states now wt line all_done last gitdir created
+    if ! states=$(t3_worktree_states 2>&1); then
+        echo "  reading t3 database failed, skipped: $states"
+        return
+    fi
+    now=$(date +%s)
+    for wt in "$T3_WORKTREES"/*/*; do
+        [[ -f "$wt/.git" ]] || continue
+        line=$(awk -F'\t' -v p="$wt" '$1 == p' <<<"$states")
+        if [[ -n "$line" ]]; then
+            IFS=$'\t' read -r _ all_done last <<<"$line"
+            ((all_done == 1 && now - last >= T3_SETTLED_DAYS * 86400)) || continue
+            remove_worktree "$wt" "threads settled, idle $(((now - last) / 86400))d"
+        else
+            gitdir=$(sed 's/^gitdir: //' "$wt/.git")
+            last=$(git -C "$wt" log -1 --format=%ct 2>/dev/null || echo 0)
+            created=$(stat -f %B "$gitdir" 2>/dev/null || echo 0)
+            ((created > last)) && last=$created
+            ((now - last >= T3_ORPHAN_DAYS * 86400)) || continue
+            remove_worktree "$wt" "no t3 thread, idle $(((now - last) / 86400))d"
+        fi
+    done
+}
+
+# Runs a step, or only prints it in dry-run mode. Output is indented under the step header.
+step() {
+    local name="$1"
+    shift
+    log "▶ $name"
+    if ((DRY_RUN)); then
+        echo "  (dry-run) $*"
+        return
+    fi
+    "$@" </dev/null 2>&1 | strip_ansi | sed 's/^/  /'
+}
+
+before=$(free_kb)
+log "=== daily-clean start (dry-run=$DRY_RUN), free: $(gb "$before") ==="
+
+# Before mo purge, so it does not spend time on node_modules of worktrees removed here.
+prune_t3_worktrees
+
+# Build artifacts (node_modules, dist, target, ...) in projects listed by `mo purge --paths`.
+# mo only selects artifacts with no file modified in the last 7 days, so active projects are kept.
+# Each scan root gets 60s by default; t3/conductor worktree trees need longer or mo skips them.
+export MO_PURGE_SCAN_TIMEOUT_SEC=600
+if ((DRY_RUN)); then
+    log "▶ mo purge --dry-run"
+    mo purge --dry-run </dev/null 2>&1 | strip_ansi | sed 's/^/  /'
+else
+    step "mo purge --yes" mo purge --yes
+fi
+
+# Caches, logs, package manager caches, Xcode DerivedData, Homebrew, old browser versions.
+# Respects `mo clean --whitelist`. Without a TTY, mo skips sudo-only system caches.
+# Runs after the removals above so its `pnpm store prune` drops packages they freed.
+if ((DRY_RUN)); then
+    log "▶ mo clean --dry-run"
+    mo clean --dry-run </dev/null 2>&1 | strip_ansi | sed 's/^/  /'
+else
+    step "mo clean" mo clean
+fi
+
+# Docker (OrbStack): everything not used by a running container, including volumes.
+# Skipped when OrbStack is not running so the job does not start it.
+if pgrep -xq OrbStack && docker info >/dev/null 2>&1; then
+    step "docker system prune (unused images, containers, networks, build cache)" \
+        docker system prune --all --force
+    # `system prune --volumes` only removes anonymous volumes; named ones need --all here.
+    step "docker volume prune --all" docker volume prune --all --force
+else
+    log "▶ docker: OrbStack not running, skipped"
+fi
+
+# Simulators whose runtime is no longer installed.
+step "xcrun simctl delete unavailable" xcrun simctl delete unavailable
+
+after=$(free_kb)
+freed=$((after - before))
+((freed < 0)) && freed=0
+log "=== daily-clean done, free: $(gb "$after"), freed: $(gb "$freed") ==="
+
+if ((!DRY_RUN)); then
+    osascript -e "display notification \"Freed $(gb "$freed"), free now $(gb "$after")\" with title \"Daily clean\"" >/dev/null 2>&1
+fi
