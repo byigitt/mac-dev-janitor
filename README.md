@@ -52,7 +52,7 @@ Every 10 seconds the watchdog samples `ps` and groups processes by process group
 
 | Rule | Trigger |
 |---|---|
-| memory | The group's memory footprint is ≥ 60% of physical RAM (a first Next.js compile alone can pass 9 GB). Or macOS has reported *critical* memory pressure for 30s and this is the largest group (≥ 4 GB). |
+| memory | The group's memory footprint stays ≥ 60% of physical RAM for 60s (a first Next.js compile alone can pass 9 GB; short peaks are ignored). Or macOS has reported *critical* memory pressure for 30s and this is the largest group (≥ 4 GB). |
 | overload | The machine has been ≥ 85% busy for 2 min and the group used ≥ 3 cores in that time. |
 | runaway | The group has used ≥ 0.9 cores for 20 min straight. |
 | stale | An orphaned dev tool (parent died, no terminal) that is older than 3 h. |

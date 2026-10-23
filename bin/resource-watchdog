@@ -8,8 +8,9 @@ and terminates a group when:
   overload  the machine is busy (OVERLOAD_SYSTEM_PCT of all cores over OVERLOAD_WINDOW)
             and the group used >= OVERLOAD_GROUP_PCT (100 = one core) in that window
   runaway   the group used >= RUNAWAY_GROUP_PCT over RUNAWAY_WINDOW (stuck loop)
-  memory    the group's memory footprint >= MEMORY_GROUP_GB, or macOS reports *critical*
-            memory pressure and it is the largest group with >= MEMORY_PRESSURE_GROUP_GB
+  memory    the group's memory footprint stays >= MEMORY_GROUP_GB for MEMORY_SUSTAIN_SECONDS,
+            or macOS reports *critical* memory pressure for MEMORY_PRESSURE_SECONDS and it
+            is the largest group with >= MEMORY_PRESSURE_GROUP_GB. Short peaks are ignored.
   stale     an orphaned dev-tool process (parent died, no terminal) older than
             STALE_ORPHAN_HOURS
 
@@ -47,6 +48,7 @@ CONFIG = {
     "MEMORY_GROUP_GB": round(os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") * 0.6 / 2**30, 1),
     "MEMORY_PRESSURE_GROUP_GB": 4,
     "MEMORY_PRESSURE_SECONDS": 30,
+    "MEMORY_SUSTAIN_SECONDS": 60,
     "STALE_ORPHAN_HOURS": 3,
     "KILL_GRACE": 10,
 }
@@ -177,6 +179,7 @@ class Watchdog:
         self.history = collections.defaultdict(collections.deque)  # pid -> deque[(t, cpu_s)]
         self.system_history = collections.deque()  # (t, total cpu_s of all processes)
         self.pressure_since = None
+        self.over_limit_since = {}  # pgid -> first time seen over MEMORY_GROUP_GB
         self.ncpu = os.cpu_count() or 1
 
     def cpu_pct(self, pid, proc, now, window):
@@ -240,6 +243,10 @@ class Watchdog:
         else:
             self.pressure_since = None
 
+        # Forget groups that dropped back under the limit or exited.
+        self.over_limit_since = {pgid: t for pgid, t in self.over_limit_since.items()
+                                 if pgid in candidates}
+
         largest = None
         for pgid, (members, kinds) in candidates.items():
             mem_gb = sum(footprints.get(m.pid, m.rss_kb) for m in members) / 1048576
@@ -255,7 +262,14 @@ class Watchdog:
                            else sum(runaway))
 
             if mem_gb >= CONFIG["MEMORY_GROUP_GB"]:
-                reason = f"memory: {mem_gb:.1f} GB (limit {CONFIG['MEMORY_GROUP_GB']:g} GB)"
+                self.over_limit_since.setdefault(pgid, now)
+            else:
+                self.over_limit_since.pop(pgid, None)
+            over_for = now - self.over_limit_since.get(pgid, now)
+
+            if over_for >= CONFIG["MEMORY_SUSTAIN_SECONDS"]:
+                reason = (f"memory: {mem_gb:.1f} GB for over {over_for:.0f}s "
+                          f"(limit {CONFIG['MEMORY_GROUP_GB']:g} GB)")
             elif busy is not None and busy >= CONFIG["OVERLOAD_SYSTEM_PCT"] and overload_pct >= CONFIG["OVERLOAD_GROUP_PCT"]:
                 reason = (f"cpu overload: {overload_pct:.0f}% CPU over {CONFIG['OVERLOAD_WINDOW']}s "
                           f"while the machine was {busy:.0f}% busy")
