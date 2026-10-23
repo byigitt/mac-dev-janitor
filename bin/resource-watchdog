@@ -8,8 +8,8 @@ and terminates a group when:
   overload  the machine is busy (OVERLOAD_SYSTEM_PCT of all cores over OVERLOAD_WINDOW)
             and the group used >= OVERLOAD_GROUP_PCT (100 = one core) in that window
   runaway   the group used >= RUNAWAY_GROUP_PCT over RUNAWAY_WINDOW (stuck loop)
-  memory    the group's memory footprint >= MEMORY_GROUP_GB, or macOS reports memory pressure
-            and it is the largest group with >= MEMORY_PRESSURE_GROUP_GB
+  memory    the group's memory footprint >= MEMORY_GROUP_GB, or macOS reports *critical*
+            memory pressure and it is the largest group with >= MEMORY_PRESSURE_GROUP_GB
   stale     an orphaned dev-tool process (parent died, no terminal) older than
             STALE_ORPHAN_HOURS
 
@@ -44,7 +44,7 @@ CONFIG = {
     "RUNAWAY_WINDOW": 1200,
     "RUNAWAY_GROUP_PCT": 90,
     "MEMORY_GROUP_GB": 8,
-    "MEMORY_PRESSURE_GROUP_GB": 1.5,
+    "MEMORY_PRESSURE_GROUP_GB": 4,
     "MEMORY_PRESSURE_SECONDS": 30,
     "STALE_ORPHAN_HOURS": 3,
     "KILL_GRACE": 10,
@@ -232,7 +232,9 @@ class Watchdog:
 
         busy = self.system_busy_pct(now)
         pressure = memory_pressure_level()
-        if pressure >= 2:
+        # Only critical: with a full swap macOS stays at "warning" even with ~40% memory free,
+        # and killing an ordinary pnpm install / tsc then frees nothing that matters.
+        if pressure >= 4:
             self.pressure_since = self.pressure_since or now
         else:
             self.pressure_since = None
@@ -271,8 +273,7 @@ class Watchdog:
 
         if (largest and self.pressure_since
                 and now - self.pressure_since >= CONFIG["MEMORY_PRESSURE_SECONDS"]):
-            level = "critical" if pressure >= 4 else "warning"
-            self.kill(largest[0], f"memory pressure {level}: largest dev process group, {largest[1]:.1f} GB")
+            self.kill(largest[0], f"memory pressure critical: largest dev process group, {largest[1]:.1f} GB")
             self.pressure_since = None
 
     def kill(self, members, reason):

@@ -52,7 +52,7 @@ Every 10 seconds the watchdog samples `ps` and groups processes by process group
 
 | Rule | Trigger |
 |---|---|
-| memory | The group's memory footprint is ≥ 8 GB. Or macOS has reported memory pressure for 30s and this is the largest group (≥ 1.5 GB). |
+| memory | The group's memory footprint is ≥ 8 GB. Or macOS has reported *critical* memory pressure for 30s and this is the largest group (≥ 4 GB). |
 | overload | The machine has been ≥ 85% busy for 2 min and the group used ≥ 3 cores in that time. |
 | runaway | The group has used ≥ 0.9 cores for 20 min straight. |
 | stale | An orphaned dev tool (parent died, no terminal) that is older than 3 h. |
